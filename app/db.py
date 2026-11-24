@@ -58,6 +58,16 @@ CREATE TABLE IF NOT EXISTS retrieval (
     created_at        TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (period_id, new_district_id, old_district_id)
 );
+
+-- 年报员按期提交的完工草稿：每个新区一行，整稿在一个写事务内替换
+CREATE TABLE IF NOT EXISTS draft (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    period_id         INTEGER NOT NULL REFERENCES period(id) ON DELETE CASCADE,
+    new_district_id   INTEGER NOT NULL REFERENCES new_district(id) ON DELETE CASCADE,
+    completed         INTEGER NOT NULL CHECK (completed >= 0),
+    submitted_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (period_id, new_district_id)
+);
 """
 
 

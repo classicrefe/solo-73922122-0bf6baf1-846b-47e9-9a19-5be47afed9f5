@@ -63,6 +63,38 @@ def seed_demo(conn: sqlite3.Connection) -> None:
     except sqlite3.IntegrityError:
         # 并发启动下另一进程已建档，忽略
         pass
+    else:
+        seed_demo_draft(conn)
+
+
+# 演示草稿：合计 32+18+14+18 = 82，等于底账合计 30+24+18+10。
+# 无档案时 N1 受重叠容量限制至少调减 2（R=2）；登记 N2/N3 档案后，
+# 固定查回数进一步改变最小调减方案，便于在 /docs 观察改数单变化。
+DEMO_DRAFT = {"N1": 32, "N2": 18, "N3": 14, "N4": 18}
+
+
+def seed_demo_draft(conn: sqlite3.Connection) -> None:
+    prow = conn.execute(
+        "SELECT id FROM period WHERE code = ?", (DEMO.code,)
+    ).fetchone()
+    if prow is None:
+        return
+    pid = prow["id"]
+    existed = conn.execute(
+        "SELECT COUNT(*) AS c FROM draft WHERE period_id = ?", (pid,)
+    ).fetchone()["c"]
+    if existed:
+        return
+    for ncode, completed in DEMO_DRAFT.items():
+        nid = conn.execute(
+            "SELECT id FROM new_district WHERE period_id = ? AND code = ?",
+            (pid, ncode),
+        ).fetchone()["id"]
+        conn.execute(
+            "INSERT INTO draft(period_id, new_district_id, completed) VALUES (?, ?, ?)",
+            (pid, nid, completed),
+        )
+    conn.commit()
 
 
 # 一组与底账相容的查回数，供 /docs 试用与测试参考：

@@ -1,8 +1,13 @@
 # 建设年报改造完工楼栋补算 API
 
-按**现行区界**补算历年改造完工楼栋数的后端服务。给定各期旧区完工底账、新旧区
-重叠范围的楼栋总数、各新区调档费用，在调档结果与底账相容的前提下，给出
-**总费用最低的待调名单与金额**；照单调完后可**唯一**算出各新区完工数。
+按**现行区界**补算历年改造完工楼栋数的后端服务，包含两组能力：
+
+1. **调档规划**：给定各期旧区完工底账、新旧区重叠范围楼栋总数、各新区调档费用，
+   在调档结果与底账相容的前提下，给出**总费用最低的待调名单与金额**；
+   照单调完后可**唯一**算出各新区完工数。
+2. **完工草稿与改数单**：年报员按期提交新区完工草稿（合计对底账），
+   在档案可能尚未查全的情况下，按楼栋汇总数求出**最小调减总数**，
+   并给出一套对应的各新区增减数与各重叠范围完工数。
 
 技术栈：FastAPI + SQLite（WAL）+ Pydantic，Docker Compose 启动。
 
@@ -33,6 +38,41 @@ tie-break 规则：费用低 → 待调个数少 → 名单编码字典序小。
 
 整数边容量 `0 ≤ x ≤ t` 下，条件 2、3 同时成立即保证存在可行分配。
 
+### 1.1 完工草稿与最小调减改数单
+
+年报员按现行新区界提交草稿 `d_N`（每个新区一个非负整数，**合计等于底账合计**
+`T = Σ c_O`）。档案可能没查全：
+
+- 已查回的重叠范围 `(N,O)`，完工数 `x_{N,O}` **照录**，不可更改；
+- 其余未查范围可填 `0 ≤ x_{N,O} ≤ t_{N,O}` 的整数；
+- 各旧区合计须对上底账 `Σ_N x_{N,O} = c_O`；
+- 新区最终完工数 `y_N = Σ_O x_{N,O}`，增减数 `Δ_N = y_N − d_N`；
+- 目标：最小化调减总数 `R = Σ_N max(0, d_N − y_N)`。
+
+**按楼栋汇总数求解（Dinic 最大流，不逐栋展开）。** 剥离已查档案：
+
+- `f_N` = 新区 N 已查回完工数；自由边容量仍为该范围楼栋总数 `t_{N,O}`；
+- 旧区 O 尚需自由边凑足的余数 `r_O = c_O − Σ已查 x`；
+- 新区自由量 `w_N = y_N − f_N`（无自由边则为 0）；令 `g_N = d_N − f_N`。
+
+由恒等式 `max(0, g−w) = max(0, g) − min(max(0, g), w)` 得
+
+```
+R = H_free − M_A + H_trapped
+```
+
+- `H_free = Σ_{N 有自由边} max(0, g_N)`；
+- `H_trapped = Σ_{N 无自由边} max(0, g_N)`：已查全、最终数锁定为 `f_N`，
+  草稿高出部分必然调减；
+- `M_A` 是受限网络最大流：源 → 有自由边且 `g_N>0` 的新区（容量 `g_N`），
+  新区 → 旧区自由边（容量 `t_{N,O}`），旧区 → 汇（容量 `r_O`）。
+
+先求 `M_A`，再给每个有自由边的新区补一条无限容量源边把旧区余数填满，
+即可重建一套达到最小调减的完整边流量方案。所有容量都是**汇总楼栋数**，
+Dinic 复杂度只取决于节点/边数（每期新区 ≤ 18），与单栋规模无关。
+建边按编码排序、DFS 按邻接表顺序增广，最小调减总数唯一，等值最优解按此
+顺序确定一套改数单。
+
 ## 2. 数据模型（SQLite）
 
 | 表 | 关键字段 |
@@ -42,15 +82,18 @@ tie-break 规则：费用低 → 待调个数少 → 名单编码字典序小。
 | `new_district` | 期次、编码、名称、调档费用（>0） |
 | `overlap` | 期次、新区、旧区、重叠楼栋总数（>0），三元组唯一 |
 | `retrieval` | 期次、新区、旧区、查回完工数，`(期次,新区,旧区)` 唯一 |
+| `draft` | 期次、新区、草稿完工数（≥0）、提交时间，`(期次,新区)` 唯一 |
 
 并发与事务：
 
-- 开启 **WAL**：核算走只读快照（`BEGIN`），登记走写事务，二者不互斥；
-- 所有登记使用 **`BEGIN IMMEDIATE`** 立即取写锁，并发登记被数据库串行化，
+- 开启 **WAL**：核算/改数单走只读快照（`BEGIN`），登记/草稿提交走写事务，二者不互斥；
+- 所有写操作使用 **`BEGIN IMMEDIATE`** 立即取写锁，并发写被数据库串行化，
   配合 `busy_timeout=5000` 等待锁；
-- 任一校验失败即 `ROLLBACK`，**原记录保留**；
-- 同一新区相同结果重送幂等返回 201，异值返回 409 且不覆盖；
-- 计划/核算端点在单个只读事务内读同一已提交状态，核算期间登记照常进行。
+- 任一校验失败即 `ROLLBACK`，**原记录/原稿保留**；
+- 同一新区相同档案重送幂等返回 201，异值返回 409 且不覆盖；
+- 草稿整稿替换在**单个写事务**内先删后插，失败回滚，并发提交只留一稿；
+- 计划/核算/改数单端点在单个只读事务内读**同一已提交状态**（底账+档案+草稿），
+  核对期间登记照常进行，登记或清空后再查即按新记录出单。
 
 ## 3. API 一览（启动后见 `/docs` 交互文档）
 
@@ -64,6 +107,9 @@ tie-break 规则：费用低 → 待调个数少 → 名单编码字典序小。
 | POST | `/periods/{code}/retrievals` | 登记一份新区档案（同值幂等、异值退回） |
 | GET | `/periods/{code}/retrievals` | 已登记档案 |
 | DELETE | `/periods/{code}/retrievals` | 清空该期登记（便于在 /docs 重复试用） |
+| POST | `/periods/{code}/draft` | **提交/替换完工草稿**（非负、合计对底账；失败保留原稿） |
+| GET | `/periods/{code}/draft` | 查询当前草稿（无草稿时 `items` 为空） |
+| GET | `/periods/{code}/change-order` | **最小调减改数单**：调减总数、各新区增减数、各重叠范围完工数 |
 
 ## 4. 用 Docker Compose 启动
 
@@ -74,7 +120,8 @@ docker compose up --build
 ```
 
 数据持久化在命名卷 `retrocalc-data`（容器内 `/data/app.db`）。
-首次启动自动播种演示期次 `DEMO-2023`（库中已有期次时不重复播种）。
+首次启动自动播种演示期次 `DEMO-2023`（库中已有期次时不重复播种），
+并随附一份演示完工草稿 `N1=32,N2=18,N3=14,N4=18`（合计 82 对底账）。
 
 本地无 Docker 时的等价运行方式：
 
@@ -126,6 +173,55 @@ curl -i -X POST $B/retrievals -H 'Content-Type: application/json' \
 # 完工余数无法由未查楼栋凑足 -> 409
 ```
 
+### 5.1 草稿与改数单：档案变动前后各出一单
+
+```bash
+B=http://localhost:8000/periods/DEMO-2023
+curl -s -X DELETE $B/retrievals >/dev/null   # 先清空，便于重复试用
+
+# 查看随启动播种的草稿（合计 82 = 底账合计）
+curl -s $B/draft
+# {"total":82,"ledger_total":82, items: N1=32,N2=18,N3=14,N4=18}
+
+# 提交一稿（键必须恰好覆盖全部新区，值非负，合计对底账，否则 422 且原稿保留）
+curl -s -X POST $B/draft -H 'Content-Type: application/json' \
+  -d '{"counts":{"N1":32,"N2":18,"N3":14,"N4":18}}'
+
+# 档案变动前（无档案也能出单）：N1 受重叠容量限制至少调减 2 栋
+curl -s $B/change-order
+# total_reduction=2, total_increase=2
+# adjustments: N1 32->30(-2), N4 18->20(+2)，N2/N3 不变
+
+# 登记 N2 档案后再查：查回数照录，N2 锁定为 16（草稿 18，再减 2）
+curl -s -X POST $B/retrievals -H 'Content-Type: application/json' \
+  -d '{"new_code":"N2","counts":{"O1":10,"O3":6}}' >/dev/null
+curl -s $B/change-order
+# total_reduction=4；N2/O1=10、N2/O3=6 两条 source=retrieved 照录
+
+# 再登记 N3，档案查全：各新区数被唯一确定，与 /accounting 一致
+curl -s -X POST $B/retrievals -H 'Content-Type: application/json' \
+  -d '{"new_code":"N3","counts":{"O2":14,"O3":2}}' >/dev/null
+curl -s $B/change-order
+# N1=30(-2), N2=16(-2), N3=16(+2), N4=20(+2)，final_total=82 对底账
+
+# 核对期间可随时登记/清空；清空后再查即回到无档案结果
+curl -s -X DELETE $B/retrievals >/dev/null
+curl -s $B/change-order        # total_reduction 回到 2
+```
+
+改数单响应里 `overlap_completed` 逐条给出每个重叠范围的楼栋总数、完工数与
+来源（`retrieved` 档案照录 / `solved` 未查范围求解）；未提交草稿时
+`status=no_draft`，档案与底账不相容时 `status=infeasible`，均不抛 500。
+
+草稿校验类试用：
+
+```bash
+# 合计不等于底账合计 82 -> 422，原稿仍可 GET 查回
+curl -i -X POST $B/draft -H 'Content-Type: application/json' \
+  -d '{"counts":{"N1":99,"N2":0,"N3":0,"N4":0}}'
+# 含负数 -> 422；新区键集合不符（缺/多编码）-> 422
+```
+
 ## 6. 测试
 
 ```bash
@@ -135,16 +231,21 @@ curl -i -X POST $B/retrievals -H 'Content-Type: application/json' \
 - `tests/test_api.py`：建档校验、最低费用计划、四类登记校验、幂等/异值、
   计划推进、唯一核算、**真实 uvicorn 下的并发登记**、快照读不阻塞写；
 - `tests/test_solver.py`：18 新区完全图性能与正确性、链状图选便宜覆盖、
-  脏数据触发 `infeasible` 防御、单未查边唯一求解。
+  脏数据触发 `infeasible` 防御、单未查边唯一求解；
+- `tests/test_revision.py`：草稿三类校验与失败留稿、整稿替换、
+  无档案/部分档案/查全三态改数单（手工核对最小调减与边值）、档案照录、
+  旧区对底账与增减守恒、**百万级汇总容量毫秒求解**、登记/清空后重新出单、
+  脏档案 `infeasible` 防御、**真实 uvicorn 下并发提交草稿与读写并发**。
 
 ## 7. 目录结构
 
 ```
 app/
-  db.py        # SQLite 连接、WAL、IMMEDIATE 写事务、只读快照
-  schemas.py   # Pydantic 请求/响应模型
+  db.py        # SQLite 连接、WAL、IMMEDIATE 写事务、只读快照、建表（含 draft）
+  schemas.py   # Pydantic 请求/响应模型（含草稿、改数单）
   services.py  # 相容性校验、最小权顶点覆盖 DP、唯一核算
-  seed.py      # 演示期次种子数据
+  revision.py  # 草稿提交/查询、Dinic 最大流、最小调减改数单
+  seed.py      # 演示期次种子数据与演示草稿
   main.py      # FastAPI 路由
 tests/         # pytest 套件
 Dockerfile  docker-compose.yml  requirements.txt  pytest.ini

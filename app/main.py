@@ -10,6 +10,9 @@ GET    /periods/{period_code}/accounting  核算；无需再调档时返回各�
 POST   /periods/{period_code}/retrievals  登记一份新区档案（同值幂等、异值退回）
 GET    /periods/{period_code}/retrievals  已登记档案
 DELETE /periods/{period_code}/retrievals  清空登记（便于在 /docs 重复试用）
+POST   /periods/{period_code}/draft       提交/替换完工草稿（失败保留原稿）
+GET    /periods/{period_code}/draft       查询当前草稿
+GET    /periods/{period_code}/change-order 改数单：最小调减总数与对应方案（只读快照）
 """
 from __future__ import annotations
 
@@ -20,12 +23,19 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI
 from fastapi.responses import JSONResponse
 
-from . import services
+from . import revision, services
 from .db import connect, get_conn, init_db, snapshot_read
 from .schemas import (
     AccountingOut,
+    ChangeOrderOut,
+    DraftIn,
+    DraftItemOut,
+    DraftOut,
+    DraftSubmitOut,
     MessageOut,
+    NewAdjustmentOut,
     NewCompletedOut,
+    OverlapCompletedOut,
     PeriodOut,
     PeriodSetupIn,
     PlanOut,
@@ -275,4 +285,139 @@ def list_retrievals(period_code: str, conn: sqlite3.Connection = Depends(get_con
 def delete_retrievals(period_code: str, conn: sqlite3.Connection = Depends(get_conn)):
     services.reset_retrievals(conn, period_code)
     return {"detail": f"期次 {period_code} 的登记已清空"}
+
+
+# ---------------------------------------------------------------- 完工草稿
+
+@app.post(
+    "/periods/{period_code}/draft",
+    response_model=DraftSubmitOut,
+    tags=["完工草稿"],
+    summary="提交/替换完工草稿（校验失败保留原稿）",
+)
+def post_draft(
+    period_code: str,
+    payload: DraftIn,
+    conn: sqlite3.Connection = Depends(get_conn),
+):
+    counts, submitted_at, replaced = revision.submit_draft(conn, period_code, payload)
+    with snapshot_read(conn):
+        data = services._load_period(conn, period_code)
+        items = [
+            DraftItemOut(new_code=n, name=data.new_names[n], completed=counts[n])
+            for n in data.new_codes
+        ]
+        ledger_total = sum(data.old_completed.values())
+        return DraftSubmitOut(
+            period_code=period_code,
+            replaced=replaced,
+            submitted_at=submitted_at,
+            items=items,
+            total=sum(counts.values()),
+            ledger_total=ledger_total,
+            message=("草稿已替换原稿" if replaced else "草稿已提交"),
+        )
+
+
+@app.get(
+    "/periods/{period_code}/draft",
+    response_model=DraftOut,
+    tags=["完工草稿"],
+    summary="查询当前草稿（无草稿时 items 为空）",
+)
+def get_draft(period_code: str, conn: sqlite3.Connection = Depends(get_conn)):
+    with snapshot_read(conn):
+        data = services._load_period(conn, period_code)
+        counts, submitted_at = revision.load_draft(conn, period_code)
+        items = [
+            DraftItemOut(
+                new_code=n, name=data.new_names[n], completed=counts.get(n, 0)
+            )
+            for n in data.new_codes
+            if n in counts
+        ]
+        return DraftOut(
+            period_code=period_code,
+            submitted_at=submitted_at,
+            items=items,
+            total=sum(counts.values()),
+            ledger_total=sum(data.old_completed.values()),
+        )
+
+
+# ---------------------------------------------------------------- 改数单
+
+@app.get(
+    "/periods/{period_code}/change-order",
+    response_model=ChangeOrderOut,
+    tags=["改数单"],
+    summary="最小调减改数单（同一快照取草稿、底账、档案；档案没查全也能出单）",
+)
+def get_change_order(period_code: str, conn: sqlite3.Connection = Depends(get_conn)):
+    with snapshot_read(conn):
+        data = services._load_period(conn, period_code)
+        draft, _submitted_at = revision.load_draft(conn, period_code)
+        ledger_total = sum(data.old_completed.values())
+        if not draft:
+            return ChangeOrderOut(
+                period_code=period_code,
+                status="no_draft",
+                has_draft=False,
+                total_reduction=None,
+                total_increase=None,
+                adjustments=None,
+                overlap_completed=None,
+                ledger_total=ledger_total,
+                final_total=None,
+                message="尚未提交完工草稿，请先 POST /periods/{code}/draft",
+            )
+
+        result = revision.solve_change_order(data, draft)
+        if result.status != "ok":
+            return ChangeOrderOut(
+                period_code=period_code,
+                status="infeasible",
+                has_draft=True,
+                total_reduction=None,
+                total_increase=None,
+                adjustments=None,
+                overlap_completed=None,
+                ledger_total=ledger_total,
+                final_total=None,
+                message=result.message,
+            )
+
+        adjustments = [
+            NewAdjustmentOut(
+                new_code=n,
+                name=data.new_names[n],
+                draft_completed=result.adjustments[n][0],
+                final_completed=result.adjustments[n][1],
+                delta=result.adjustments[n][2],
+            )
+            for n in data.new_codes
+        ]
+        overlap_completed = [
+            OverlapCompletedOut(
+                new_code=n,
+                old_code=o,
+                building_total=result.overlaps[(n, o)][0],
+                completed_count=result.overlaps[(n, o)][1],
+                source=result.overlaps[(n, o)][2],
+            )
+            for o in data.old_codes
+            for n, _t in data.old_edges[o]
+        ]
+        return ChangeOrderOut(
+            period_code=period_code,
+            status="ok",
+            has_draft=True,
+            total_reduction=result.total_reduction,
+            total_increase=result.total_increase,
+            adjustments=adjustments,
+            overlap_completed=overlap_completed,
+            ledger_total=ledger_total,
+            final_total=result.final_total,
+            message=result.message,
+        )
 
